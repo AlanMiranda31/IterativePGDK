@@ -1,0 +1,109 @@
+function kenelMatrixNS = PGDKernelMatrixCalc(compositePrior,compositePriorReducedCounts,nknn,searchNeigh,maxite,tol)
+
+% Calculates the (sparse) kernel matrix for PET dynamic reconstructions
+% with the PGD algorithm (PGDK)
+%
+% The liner voxel index is calculated following Matlab indexing, i.e.
+% column-wise. For example the linear voxel index of image element at row = 13,
+% column = 11, depth = 21, in an image with xsize = 128, ysize = 128, and zsize = 159 is:
+%
+% linear_index = row+(ysize)*(column-1)+(xsize*ysize)*(depth-1) = 328973
+%
+% Sparse kernel matrix row 328973 therefore has the kernel matrix weights of this
+% voxel
+%
+% ****** Input ****** 
+% compositePrior : 4D image of PET high quality composite priors concatenated along the 4th dimension, in single precission 4D array format, calculated with e.g. MLEM reconstruction
+% compositePriorReducedCounts : 4D image of PET reduced counts composite priors concatenated along the 4th dimension, in single precission 4D array format, calculated with e.g. MLEM reconstruction
+% nknn : number of closest neighbors for the kernel matrix calculation
+% searchNeigh : closest neighbors cubic window size. Must be odd
+% maxite : maximum number of iterations for the PGD calculation
+% tol : convergence tolerance of the PGD optimization defined as the paramteres relative difference between iterations
+%
+% ****** Outut ****** 
+% kenelMatrixNS : kernel matrix in sparse Matlab matrix format
+
+xres = size(compositePrior,2);
+yres = size(compositePrior,1);
+zres = size(compositePrior,3);
+ncompositeframes = size(compositePrior,4);
+
+nvoxels = xres*yres*zres;
+
+featureMatrixStdNorm = zeros(ncompositeframes,nvoxels,'single');
+featureMatrixFull = zeros(ncompositeframes,nvoxels,'single');
+featureMatrixLow = zeros(ncompositeframes,nvoxels,'single');
+
+for jk=1:ncompositeframes
+    
+    Image = compositePrior(:,:,:,jk);
+    
+    featureMatrixStdNorm(jk,:) = Image(:)';   
+	featureMatrixStdNorm(jk,:) = featureMatrixStdNorm(jk,:)/std(featureMatrixStdNorm(jk,:));
+    
+    featureMatrixFull(jk,:) = Image(:)'; 
+    
+    Image = compositePriorReducedCounts(:,:,:,jk);
+    featureMatrixLow(jk,:) = Image(:)'; 
+    
+end
+
+% Image segmentation based on Otsu threshold to obtain active voxels
+
+segmentationthresh = 0.1;
+auxCompPriorMean = mean(compositePrior,4);
+otth = calcOtsuThresholdSingle(auxCompPriorMean);
+mask = zeros(size(auxCompPriorMean),'single');
+mask(auxCompPriorMean(:)>otth*segmentationthresh) = 1;
+CC = bwconncomp(mask);
+maskTemp = zeros(size(mask),'single');
+for i=1:length(CC.PixelIdxList)
+    if length(CC.PixelIdxList{i})>1000
+        maskTemp(CC.PixelIdxList{i}) = 1;
+    end
+end
+maskFilled = imfill(maskTemp,'holes');
+
+inNoAct = find(maskFilled(:)==0);
+
+% Closest neighbors calculation
+Idx = findKNN(featureMatrixStdNorm,int32(xres),int32(yres),int32(zres),int32(searchNeigh),int32(nknn),int32(maskFilled));
+
+kernelMatrixInit = ones(size(Idx),'single');
+kernelMatrixInit(:) = 1/nknn;
+
+flagInAct = ones(size(Idx,1),1,'int32');
+flagInAct(inNoAct) = 0;
+% PGD optimization
+disp('Running calculation of PGD kernel matrix ...')
+tic;
+[kernelMatrixAdjusted,objFvalAccC] = kernelPGDcalculation(featureMatrixFull,featureMatrixLow,Idx,kernelMatrixInit,int32(maxite),single(tol),flagInAct);
+tt = toc;
+disp(['Calculation of PGD kernel matrix finished in ',num2str(tt),' seconds']);
+kernelMatrix = kernelMatrixAdjusted;
+
+% Creation of sparse kernel matrix using closest neighbors indices and
+% optimized weights
+
+Idx(inNoAct,1) = int32(inNoAct);
+kernelMatrix(inNoAct,1) = 1.0;
+kernelMatrix(inNoAct,2:end) = 0.0;
+
+kenelMatrixN = zeros(size(kernelMatrix),'single');
+
+for j=1:nvoxels
+    n = sum(kernelMatrix(j,:));
+    if n~=0
+        kenelMatrixN(j,:) = kernelMatrix(j,:)/n;
+    end
+end
+
+zz = find(kenelMatrixN(:)>0);
+Idx = Idx(zz);
+kenelMatrixN = kenelMatrixN(zz);
+
+auxrow = repmat([1:nvoxels]',1,nknn);
+auxrow = auxrow(zz);
+kenelMatrixNS = sparse(auxrow(:),double(Idx(:)),double(kenelMatrixN(:)),nvoxels,nvoxels);
+
+end
